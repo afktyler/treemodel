@@ -1,0 +1,529 @@
+---
+title: "Temperature Predictions"
+author: "Tyler Watson"
+date: "2023-04-11"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_knit$set(root.dir = "~/")
+```
+
+```{r warning=F, message=F, echo=FALSE}
+library(ISLR2)
+library(tidyverse)
+library(broom)
+library(patchwork) 
+library(tictoc)
+library(pROC)
+library(MASS)
+library(caret)
+library(rpart)
+library(maptree)
+library(rpart.plot)
+library(boot)
+library(randomForest)
+library(car)
+library(jtools)
+```
+
+```{r}
+shangog <- read.csv("~/mlprjs/shanghaiweather.csv")
+shang <- shangog[,c(1,3,8,10,12,16,18,20,22,26,29)]
+
+df_shang <- shang %>% 
+  mutate(fog = ifelse(FRSHTT >= 100000,1,0),
+         rain = ifelse(FRSHTT >= 10000 & FRSHTT < 100000 ,1,0)) 
+
+df_shang <- df_shang %>% drop_na()
+
+df_shang <- df_shang[,-c(11)]
+
+df_shang2021<- df_shang[c(20292:21010),]
+```
+
+```{r}
+cor(df_shang2021[,-c(1,2,9)])
+plot(df_shang2021[,-c(1,2,9)])
+```
+
+
+```{r}
+#tree model
+
+set.seed(1)
+
+trainRowNumbers <- createDataPartition(df_shang2021$X, times = 1, p=0.7, list=FALSE)
+train<- df_shang2021[trainRowNumbers,]
+test<- df_shang2021[-trainRowNumbers,]
+
+tree_models <- rpart(TEMP ~ DEWP + SLP + VISIB + WDSP + MXSPD  + PRCP + rain + fog, data = train, method = "anova") 
+
+prp(tree_models, extra = 1)
+
+yhat <- predict(tree_models, newdata = test, type = "vector")
+
+actual <- test$TEMP
+
+meantemp <- mean(test$TEMP)
+
+k <- 8
+n <- nrow(test)
+dfr <- k
+dfe <- n-k-1
+dft <- n-1
+
+mse <- sum((actual - yhat)^2)/nrow(test)
+
+sse <- sum((actual - yhat)^2)
+
+sst <- sum((actual - meantemp)^2)
+
+Rsqr  <- 1 - (sse/sst)
+
+Rsqradj <- 1 - ((sse/dfe)/(sst/dft))
+
+ssqr <- mse
+
+rrs_tree <-  as.data.frame(c(Rsqr, Rsqradj, ssqr))
+rrsname <-  as.data.frame(t(t(c("Coefficient of Determination","Coefficient of Determination adjusted","variance of error term"))))
+
+
+
+rrsdf <- data.frame(rrsname,rrs_tree)
+
+colnames(rrsdf)[1] ="term"
+colnames(rrsdf)[2] ="value"
+
+tree_modelst <- rpart(TEMP ~ DEWP + SLP + VISIB + WDSP + MXSPD  + PRCP + rain + fog, data = test, method = "anova") 
+
+prp(tree_modelst, extra = 1)
+
+```
+```{r}
+library(plyr)
+set.seed(123)
+form <- "TEMP ~ DEWP + SLP + VISIB + WDSP + MXSPD  + PRCP + rain + fog"
+folds <- split(df_shang2021, cut(sample(1:nrow(df_shang2021)),10))
+errs <- rep(NA, length(folds))
+
+
+kfoldmsetrain = vector(mode="numeric")
+kfoldmse = vector(mode="numeric")
+
+for (i in 1:length(folds)) {
+ testk <- ldply(folds[i], data.frame)
+ traink <- ldply(folds[-i], data.frame)
+ tmp.model <- rpart(form , traink, method = "anova")
+ tmp.predict <- predict(tmp.model, newdata = testk, type = "vector")
+ kfoldmse[i] <- sum((testk$TEMP-tmp.predict)^2)/nrow(testk)
+ 
+ tmp.predicttr <- predict(tmp.model, newdata = traink, type = "vector")
+ kfoldmsetrain[i] <- sum((traink$TEMP-tmp.predicttr)^2)/nrow(traink)
+}
+
+kfoldmsetrain
+kfoldmse
+
+xk <- seq(1,10,1)
+
+plot(xk,kfoldmse,ylim = c(0,50), type="n")
+lines(xk,kfoldmsetrain,col = "blue")
+lines(xk,kfoldmse)
+legend(40, 6, legend=c("m=p","m=sqrt(p)", "m=p/2"),
+       col=c('black',"red", "blue"), lty=1:1, cex=0.8)
+```
+
+
+
+```{r}
+tree_models$cptable
+
+```
+
+
+```{r}
+prune_tree <- prune(tree_models,
+   cp = tree_models$cptable[tree_models$cptable[, 2] == 5, "CP"])
+rpart.plot(prune_tree, yesno = TRUE)
+
+plotcp(tree_models)
+```
+
+```{r}
+prune_tree$variable.importance
+
+varImp(tree_models)
+
+```
+
+
+
+```{r}
+tree_modelst$variable.importance %>% 
+   data.frame() %>%
+   rownames_to_column(var = "Feature") %>%
+   ggplot(aes(x = fct_reorder(Feature, .), y = .)) +
+   geom_pointrange(aes(ymin = 0, ymax = .), color = "cadetblue", size = .3) +
+   theme_minimal() +
+   coord_flip() +
+   labs(x = "", y = "", title = "Variable Importance")
+
+
+```
+
+
+```{r}
+library(randomForest)
+```
+
+
+```{r, warning = FALSE}
+set.seed(4)
+
+bag_shang_loop = vector(mode="numeric")
+mse_bagging = vector(mode = "numeric")
+for(i in 1:50){
+bag_shang_loop <- randomForest(TEMP ~ DEWP + SLP + VISIB + WDSP + MXSPD  + PRCP + rain + fog, data = df_shang2021, mtry = 8, importance = TRUE, ntree = i)
+
+bag_shang_test2 <- df_shang2021[-trainRowNumbers,"TEMP"]
+yhat_bag2 = predict(bag_shang_loop, newdata = test)
+
+mse_bagging[i] = mean((yhat_bag2 - bag_shang_test2)^2)
+}
+
+
+```
+
+```{r}
+varImpPlot(bag_shang_loop, main = "Variable Importance of Bagging Model")
+
+
+bag_shang_loop$importance
+
+bag_shang_loop$importanceSD
+
+```
+
+
+```{r}
+sseb <- sum((yhat_bag2 - bag_shang_test2)^2)
+
+sstb <- sum((yhat_bag2 - meantemp)^2)
+
+Rsqr_bagging  <- 1 - (sseb/sstb)
+
+Rsqradj_bagging <- 1 - ((sseb/dfe)/(sstb/dft))
+
+ssqr_bagging <- mse_bagging[50]
+
+rrs_bag <-  as.data.frame(c(Rsqr_bagging, Rsqradj_bagging, ssqr_bagging))
+rrsname_bag <-  as.data.frame(t(t(c("Coefficient of Determination","Coefficient of Determination adjusted","variance of error term"))))
+
+s <- sqrt(mse)
+
+rrsdf_bag <- data.frame(rrsname_bag,rrs_bag)
+
+colnames(rrsdf_bag)[1] ="term"
+colnames(rrsdf_bag)[2] ="value"
+
+
+```
+
+# random forest
+
+```{r}
+# Random Forest
+
+set.seed(3)
+
+rf_shang <- randomForest(TEMP ~ DEWP + SLP + VISIB + WDSP + MXSPD  + PRCP + rain + fog, data = df_shang2021, mtry = sqrt(8), importance = TRUE)
+
+rf_shang_test <- df_shang2021[-trainRowNumbers,"TEMP"]
+yhat_rf = predict(rf_shang, newdata = test)
+plot(yhat_rf, rf_shang_test)
+abline(a=0,b=1)
+
+mean((yhat_rf - rf_shang_test)^2)
+```
+
+```{r}
+
+set.seed(4)
+
+rf_shang_loop = vector(mode="numeric")
+rfmse2 = vector(mode = "numeric")
+for(i in 1:50){
+rf_shang_loop <- randomForest(TEMP ~ DEWP + SLP + VISIB + WDSP + MXSPD  + PRCP + rain + fog, data = df_shang2021, mtry = sqrt(8), importance = TRUE, ntree = i)
+
+rf_shang_test2 <- df_shang2021[-trainRowNumbers,"TEMP"]
+yhat_rf2 = predict(rf_shang_loop, newdata = test)
+
+rfmse2[i] = mean((yhat_rf2 - rf_shang_test2)^2)
+}
+```
+
+
+```{r}
+sserf <- sum((yhat_rf2 - rf_shang_test2)^2)
+
+sstrf <- sum((yhat_rf2 - meantemp)^2)
+
+Rsqr_rf  <- 1 - (sserf/sstrf)
+
+Rsqradj_rf <- 1 - ((sserf/dfe)/(sstrf/dft))
+
+ssqr_rf <- rfmse2[50]
+
+rrs_rf <-  as.data.frame(c(Rsqr_rf, Rsqradj_rf, ssqr_rf))
+rrsname_rf <-  as.data.frame(t(t(c("Coefficient of Determination","Coefficient of Determination adjusted","variance of error term"))))
+
+
+rrsdf_rf <- data.frame(rrsname_rf,rrs_rf)
+```
+
+```{r}
+varImpPlot(rf_shang_loop, main = "Variable Importance on Random Forest when m = sqrt(p)")
+rf_shang_loop$importance
+
+rf_shang_loop$importanceSD
+```
+
+
+```{r}
+set.seed(4)
+
+rf_shang_loop_2 = vector(mode="numeric")
+rfmse_p2 = vector(mode = "numeric")
+
+for(i in 1:50){
+rf_shang_loop_2 <- randomForest(TEMP ~ DEWP + SLP + VISIB + WDSP + MXSPD  + PRCP + rain + fog, data = df_shang2021, mtry = 8/2, importance = TRUE, ntree = i)
+
+rf_shang_testp2 <- df_shang2021[-trainRowNumbers,"TEMP"]
+yhat_rfp2 = predict(rf_shang_loop_2, newdata = test)
+
+rfmse_p2[i] = mean((yhat_rfp2 - rf_shang_testp2)^2)
+}
+```
+
+```{r}
+varImpPlot(rf_shang_loop_2, main = "Variable Importance on Random Forest when m = p/2" )
+rf_shang_loop_2$importance
+
+rf_shang_loop_2$importanceSD
+
+
+```
+
+
+```{r}
+sserf2 <- sum((yhat_rfp2 - rf_shang_testp2)^2)
+
+
+sstrf2 <- sum((yhat_bag2 - meantemp)^2)
+
+Rsqr_rfp  <- 1 - (sserf2/sstrf2)
+
+Rsqradj_rfp <- 1 - ((sserf2/dfe)/(sstrf2/dft))
+
+ssqr_rfp <- rfmse_p2[50]
+
+rrs_rfp <-  as.data.frame(c(Rsqr_rfp, Rsqradj_rfp, ssqr_rfp))
+rrsname_rf <-  as.data.frame(t(t(c("Coefficient of Determination","Coefficient of Determination adjusted","variance of error term"))))
+
+
+rrsdf_rfp <- data.frame(rrsname_rf,rrs_rfp)
+```
+
+
+
+
+```{r}
+tree_count <- seq(1,50,1)
+plot(tree_count,rfmse2,type="n",xlab = "Tree Size", ylab = "MSE",ylim = c(1,9), main = "MSE vs Tree Size")
+lines(tree_count,rfmse2,col = "red")
+lines(tree_count,rfmse_p2, col = "blue")
+lines(tree_count,mse_bagging,col = "black")
+legend(40, 6, legend=c("m=p","m=sqrt(p)", "m=p/2"),
+       col=c('black',"red", "blue"), lty=1:1, cex=0.8)
+
+```
+```{r}
+mnm2 <- min(rfmse2)
+trm2 <- tree_count[which(rfmse2 == min(rfmse2))]
+
+mnp2 <- min(rfmse_p2)
+trp2 <- tree_count[which(rfmse_p2 == min(rfmse_p2))]
+
+mnb <- min(mse_bagging)
+trb <- tree_count[which(mse_bagging == min(mse_bagging))]
+
+minmse <- as.data.frame(t(cbind(mnm2,mnp2,mnb)))
+minnumber <- as.data.frame(t(cbind(trm2,trp2,trb)))
+
+msename <- as.data.frame(t(t(c("min_mse_sqrt(p)",'min_mse_p/2','min_mse_bagging'))))
+
+
+minmsedf <- as.data.frame(cbind(msename,minnumber,minmse))
+
+
+
+colnames(minmsedf) <- c('method','tree_count','min_mse')
+
+minmsedf
+```
+
+
+
+```{r , warning=FALSE}
+y <- test$TEMP
+obs <- test$X
+n <- length(y)
+
+xdata <- as.matrix(test[,c(4:12)])
+
+
+
+const <- rep(1,n)
+
+x <- cbind(const,xdata)
+x <- x[,-7]
+
+xtx <- t(x)%*%x
+
+xtxinv <- ginv(xtx)
+
+xty <- t(x)%*%y
+
+
+betahat <- xtxinv%*%xty
+betahat
+
+
+
+```
+
+
+
+##################
+
+
+
+```{r , warning=FALSE}
+
+yhatt <- x%*%betahat
+
+ssel <- t(y)%*%y - t(x%*%betahat)%*%y
+ssrl <- t(yhatt)%*%y - n * mean(y)^2
+sstl <- ssrl + ssel 
+
+k <- 8
+
+dfr <- k
+dfe <- n-k-1
+dft <- n-1
+
+msr <- ssrl/k
+msel <- sse/dfe
+
+f <- msr/msel
+
+pvalf <- 1-pf(f,k,dfe)
+
+Rsqr <- ssrl/sstl
+
+Rsqradj <- 1 - ((ssel/dfe)/(sstl/dft))
+
+ssqr <- msel
+
+sl <- sqrt(msel)
+
+##################
+
+
+rrs <-  as.data.frame(c(Rsqr, Rsqradj, ssqr))
+rrsname <-  as.data.frame(t(t(c("Coefficient of Determination","Coefficient of Determination adjusted","variance of error term"))))
+
+
+rrsdf <- data.frame(rrsname,rrs)
+
+colnames(rrsdf)[1] ="term"
+colnames(rrsdf)[2] ="value"
+
+
+################
+
+names <- as.data.frame(t(t(c('intercept','dewp ','slp','visib','wdsp','mxspd','prcp','fog','rain'))))
+
+sebeta <- sl*sqrt(diag(xtxinv))
+
+tval <- betahat/t(t(sebeta))
+
+pvalt <- (2*(1-pt(abs(tval),dfe)))
+
+pm <- cbind(betahat,t(t(sebeta)),tval,pvalt)
+dfpm <- as.data.frame(pm)
+
+pmdf <- data.frame(names,dfpm)
+
+colnames(pmdf) <- c('Parameters','Estimate','s.e.','t-value','p-value')
+
+pmdf
+```
+
+
+
+```{r}
+compare <- data.frame(rrsname,rrs_tree,rrs_bag,rrs_rf,rrs_rfp,rrs)
+
+colnames(compare)[1] ="term"
+colnames(compare)[2] ="single_tree"
+colnames(compare)[3] ="bagging"
+colnames(compare)[4] ="random_forest_sqrt(p)"
+colnames(compare)[5] ="random_forest_p/2"
+colnames(compare)[6] ="regression_model"
+
+
+compare
+
+
+```
+
+```{r}
+e <- y-yhattww
+
+estd <- e*c((1/sqrt(s)))
+
+h <- x%*%xtxinv%*%t(x)
+
+hii <- diag(h)
+
+estud <- e/sqrt(s^2*(1-hii))
+
+edf <- data.frame(cbind(obs,e,estd,estud,hii))
+
+colnames(edf) <- c('Obs','e','e_standarized','e_studentized','hii')
+
+```
+
+
+```{r}
+plot(yhatt,edf$e_studentized, ylab = "e studentized",ylim = c(-3.5,3.5))
+title( main = "e stundentized vs yhat")
+```
+
+
+
+
+
+
+
+
+
+
+
+
